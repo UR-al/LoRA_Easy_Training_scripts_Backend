@@ -962,7 +962,9 @@ class CAME(BaseOptimizer):
             core_factored_fn = self._compiled_factored
 
             # Pre-compute group_idx once (avoids O(n) list.index() per parameter)
-            group_idx = self.param_groups.index(group)
+            # local fix: list.index() compares dicts with '==' and trips on tensor lists when several
+            # param groups share hyper-parameters (anima_train.py uses 6 groups). Match by identity instead.
+            group_idx = next(i for i, g in enumerate(self.param_groups) if g is group)
 
             # Bucket params for foreach (unfactored only, numel >= 16)
             # Bypass foreach for 0D and very small tensors (numel < 16) where
