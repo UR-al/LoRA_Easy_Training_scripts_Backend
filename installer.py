@@ -106,17 +106,18 @@ def setup_venv(uv: str, venv_path: str = "venv"):
         venv_path=venv_path,
     )
 
+    # git packages are pinned to the same commits as sd_scripts/requirements.txt (bump both together)
     uv_pip_install(
         uv,
         "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/RamTorch",
+        "git+https://github.com/67372a/RamTorch@feae2437e2f4ecabefdb410e28342433be8c05cd",
         venv_path=venv_path,
     )
 
     uv_pip_install(
         uv,
         "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/customized-optimizers",
+        "git+https://github.com/67372a/customized-optimizers@1d0e9426c862fabd14460905ff57e289572b6a34",
         venv_path=venv_path,
     )
 
@@ -138,7 +139,7 @@ def setup_venv(uv: str, venv_path: str = "venv"):
     uv_pip_install(
         uv,
         "-U", "--force-reinstall", "--no-deps",
-        "git+https://github.com/67372a/LyCORIS@dev",
+        "git+https://github.com/67372a/LyCORIS@c2cfd8ae5c5418ea7c77923eda4afa099bc69ba5",
         venv_path=venv_path,
     )
 
