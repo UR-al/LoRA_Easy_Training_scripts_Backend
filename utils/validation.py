@@ -5,6 +5,15 @@ from library.train_util import BucketManager
 from PIL import Image
 import math
 from LoraEasyCustomOptimizer import OPTIMIZERS
+from utils.model_args import (
+    detect_models,
+    drop_gui_only_keys,
+    file_inputs as model_file_inputs,
+    keep_empty,
+    section_path_errors,
+    text_encoder_cache_errors,
+    tokenizer_errors,
+)
 
 
 def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
@@ -129,6 +138,9 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
                 passed_validation = False
                 errors.append("Keep Tokens Separator is an empty string")
                 continue
+            if keep_empty(arg, val):
+                output_args[arg] = ""
+                continue
             if (val is None or 
                 (isinstance(val, str) and val.strip() == '') or 
                 (isinstance(val, bool) and val == False)):
@@ -142,19 +154,18 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
         if "fa" in value:
             del value["fa"]
 
-    # Anima mode is detected by the presence of the 'qwen3' key (Anima-only arg).
-    # In Anima mode, pretrained_model_name_or_path holds the DiT model path,
-    # and 'qwen3' / 'vae' hold the text encoder and VAE paths respectively.
-    is_anima = "qwen3" in output_args
-    file_inputs = [
-        {"name": "pretrained_model_name_or_path", "required": True},
-        {"name": "qwen3", "required": is_anima},
-        {"name": "vae", "required": is_anima},
-        {"name": "sample_prompts", "required": False},
-        {"name": "output_dir", "required": True},
-        {"name": "logging_dir", "required": False},
-        {"name": "t5_tokenizer_path", "required": False},
-    ]
+    # Anima mode is detected by the presence of the 'qwen3' key (Anima-only arg) or the anima_args section,
+    # MOSS-Image by 'moss_text_encoder' or the moss_args section, the Anima 3.8B connector by anima38_connector.
+    # In both, pretrained_model_name_or_path holds the DiT model path (utils/model_args.py).
+    models = detect_models(args, output_args)
+    file_inputs = model_file_inputs(models)
+    for error in (
+        section_path_errors(args, models)
+        + text_encoder_cache_errors(models, output_args)
+        + tokenizer_errors(models, output_args)
+    ):
+        passed_validation = False
+        errors.append(error)
 
     for file in file_inputs:
         if file["required"] and file["name"] not in output_args:
@@ -199,6 +210,8 @@ def validate_args(args: dict) -> tuple[bool, list[str], dict]:
     config_dict = json.loads(config.read_text()) if config.is_file() else {}
     if "colab" in config_dict and config_dict["colab"]:
         output_args["console_log_simple"] = True
+    # GUI-only keys (the GUI reads them from its own TOML): not trainer options, so strict_config_keys would stop on them
+    drop_gui_only_keys(output_args)
     return passed_validation, errors, output_args
 
 
