@@ -163,6 +163,48 @@ class CAME(BaseOptimizer):
     def init_group(self, group, **kwargs) -> None:
         pass
 
+    # State tensors and the dtype they are stored in (None = state_storage_dtype), as created by _init_param_state.
+    _STATE_STORAGE_DTYPES = {
+        'exp_avg': None,
+        'exp_avg_sq': None,
+        'exp_avg_sq_hat': None,
+        'exp_avg_sq_row': torch.float32,
+        'exp_avg_sq_col': torch.float32,
+        'exp_avg_res_row': torch.float32,
+        'exp_avg_res_col': torch.float32,
+        'exp_avg_res': torch.float32,
+        'kahan_comp': torch.float32,
+    }
+
+    def load_state_dict(self, state_dict) -> None:
+        r"""Load optimizer state and keep it under the storage policy (state_storage_dtype / state_storage_device).
+
+        torch's loader casts every floating-point state tensor to its parameter's dtype and device. For a bf16
+        parameter with fp32 state storage that turned the moments and factored statistics into bf16 on resume
+        (and the fp32 write-back with plain copy_ then barely moves the beta2/beta3 EMAs). The state tensors are
+        therefore re-created from the saved values, which still have their original precision.
+        """
+        saved_state = state_dict['state']
+        id_map = dict(zip(
+            (pid for g in state_dict['param_groups'] for pid in g['params']),
+            (p for g in self.param_groups for p in g['params']),
+        ))
+        super().load_state_dict(state_dict)
+
+        for pid, saved in saved_state.items():
+            p = id_map.get(pid)
+            if p is None or p not in self.state:
+                continue
+            state = self.state[p]
+            for key, dtype in self._STATE_STORAGE_DTYPES.items():
+                value = saved.get(key)
+                if not torch.is_tensor(value):
+                    continue
+                value = value.to(device=self.state_storage_device, dtype=dtype or self.state_storage_dtype)
+                if self.state_storage_device == "cpu":
+                    value = value.pin_memory()
+                state[key] = value
+
     def _init_param_state(self, p: torch.Tensor, group: dict, grad_shape: Tuple[int, ...], factored: bool) -> None:
         r"""Initialize optimizer state tensors for a parameter on first encounter.
 
