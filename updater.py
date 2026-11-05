@@ -4,7 +4,7 @@ import sys
 
 from install_uv import ensure_uv, find_existing_venv
 from installer import (PLATFORM, DEFAULT_TORCH_PROFILE, setup_venv, parse_torch_profiles, create_profile_venv,
-                       existing_profile_venvs, check_venv_torch)
+                       existing_profile_venvs, check_venv_torch, accelerate_config_path, setup_accelerate)
 
 import logging
 
@@ -31,6 +31,9 @@ def main():
         logger.info(f"updating '{venv_path}' (PyTorch {torch_profile})")
         check_venv_torch(venv_path, torch_profile)
         setup_venv(uv, venv_path, torch_profile)
+    # an existing default Accelerate config loses the keys Accelerate rejects (an older installer wrote one)
+    if accelerate_config_path(PLATFORM).exists():
+        setup_accelerate(PLATFORM)
 
 
 if __name__ == "__main__":

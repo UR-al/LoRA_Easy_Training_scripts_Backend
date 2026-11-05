@@ -16,6 +16,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _fp32(value: float) -> torch.Tensor:
+    """A Python number as a float32 scalar: the foreach path forms its factors in float32, like the per-parameter
+    path's scalar tensors (float() of the result is exact)."""
+    return torch.tensor(value, dtype=torch.float32)
+
+
 class CAME(BaseOptimizer):
     r"""Confidence-guided Adaptive Memory Efficient Optimization.
 
@@ -768,13 +774,19 @@ class CAME(BaseOptimizer):
                     p_fp32_list[i].add_(kahan_comp_list[k_idx])
 
         # ---- Batch compute phase ----
+        # Mirrors _core_unfactored_full_fp32 operation by operation, so foreach=True gives the same parameters and
+        # state as the per-parameter path. The EMA weights (1 - beta) and the decay factors are formed in float32,
+        # as the per-parameter path does with its float32 scalar tensors.
+        one_minus_beta1 = float(1.0 - _fp32(beta1))
+        one_minus_beta2 = float(1.0 - _fp32(beta2))
+        one_minus_beta3 = float(1.0 - _fp32(beta3))
 
         # 1. EMA of squared gradient: exp_avg_sq = beta2 * exp_avg_sq + (1-beta2) * (grad^2 + eps1)
-        update_list = torch._foreach_mul(grad_list, grad_list)  # grad^2 — batched
+        update_list = torch._foreach_mul(grad_list, grad_list)  # grad^2 — batched (the per-step update buffers)
         torch._foreach_add_(update_list, group['eps1'])  # grad^2 + eps1
 
         torch._foreach_mul_(exp_avg_sq_list, beta2)
-        torch._foreach_add_(exp_avg_sq_list, update_list, alpha=1.0 - beta2)
+        torch._foreach_add_(exp_avg_sq_list, update_list, alpha=one_minus_beta2)
         # exp_avg_sq_list now holds correct EMA — preserved for write-back
 
         # 2. Compute denom = rsqrt(EMA) into update_list (reuse allocation, avoids new allocs)
@@ -785,88 +797,77 @@ class CAME(BaseOptimizer):
         # AMSBound — update hat state, then compute denom from hat
         if use_amsbound:
             # hat = max(hat, 1/denom) = max(hat, sqrt(EMA))
-            torch._foreach_max_(exp_avg_sq_hat_list, [1.0 / d for d in update_list])
+            torch._foreach_maximum_(exp_avg_sq_hat_list, [1.0 / d for d in update_list])
             # Compute denom = rsqrt(hat / beta2) into update_list (reuse allocation)
             for _i in range(len(update_list)):
                 update_list[_i].copy_(exp_avg_sq_hat_list[_i])
             torch._foreach_div_(update_list, beta2)
             torch._foreach_rsqrt_(update_list)
-        denom_list = update_list
 
-        # 3. Precondition: denom *= grad
-        torch._foreach_mul_(denom_list, grad_list)
+        # 3. Precondition: update = denom * grad
+        torch._foreach_mul_(update_list, grad_list)
 
-        # 4. RMS clip (per-tensor since norm/numel differ)
-        for upd in denom_list:
+        # 4. RMS clip (per-tensor since norm/numel differ; clamp on device, no host sync)
+        for upd in update_list:
             rms = upd.norm(2) / math.sqrt(upd.numel())
-            clip_factor = max(rms / group['clip_threshold'], 1.0)
+            clip_factor = (rms / group['clip_threshold']).clamp_(min=1.0)
             upd.div_(clip_factor)
 
-        # Save pre-momentum update values for optional confidence computation.
-        # When nfc=True, use pre-allocated staging scratch to avoid N clone allocations.
+        # 5. Momentum: exp_avg = beta1 * exp_avg + (1-beta1) * update. update_list keeps the pre-momentum update.
+        torch._foreach_mul_(exp_avg_list, beta1)
+        torch._foreach_add_(exp_avg_list, update_list, alpha=one_minus_beta1)
+
+        # 6. Confidence residual (non-factored): res = (update - exp_avg)^2 + eps2, kept in a scratch buffer
         if nfc:
             if self._use_staging:
-                # Use dedicated pre_mom_scratch buffer (separate from exp_avg_res to avoid aliasing)
-                pre_momentum_updates = []
-                for _i, p in enumerate(active_params):
-                    if p.grad is None:
-                        continue
+                # Dedicated pre_mom_scratch buffer (separate from exp_avg_res to avoid aliasing)
+                res_list = []
+                for p in active_params:
                     staging = self._get_staging(p, compute_device, factored=False,
                                                 ams_bound=use_amsbound, nfc=nfc)
-                    scratch = staging['pre_mom_scratch']
-                    scratch.copy_(denom_list[_i])
-                    pre_momentum_updates.append(scratch)
+                    res_list.append(staging['pre_mom_scratch'])
+                for _i in range(len(update_list)):
+                    res_list[_i].copy_(update_list[_i])
             else:
-                pre_momentum_updates = [d.clone() for d in denom_list]
-
-        # 4. Momentum: exp_avg = beta1 * exp_avg + (1-beta1) * update
-        torch._foreach_mul_(exp_avg_list, beta1)
-        torch._foreach_add_(exp_avg_list, denom_list, alpha=1.0 - beta1)
-
-        # 5. Confidence residual modulation (non-factored) — batched via foreach
-        if nfc:
-            # Reuse pre_momentum_updates as scratch buffer (clones of denom_list, no longer needed)
-            # Compute residual in-place: res = (pre_momentum_update - exp_avg)^2 + eps2
-            torch._foreach_sub_(pre_momentum_updates, exp_avg_list)
-            torch._foreach_mul_(pre_momentum_updates, pre_momentum_updates)
-            torch._foreach_add_(pre_momentum_updates, group['eps2'])
+                res_list = [u.clone() for u in update_list]
+            torch._foreach_sub_(res_list, exp_avg_list)
+            torch._foreach_pow_(res_list, 2.0)
+            torch._foreach_add_(res_list, group['eps2'])
 
             # EMA of residual: exp_avg_res = beta3 * exp_avg_res + (1-beta3) * res
             torch._foreach_mul_(exp_avg_res_list, beta3)
-            torch._foreach_add_(exp_avg_res_list, pre_momentum_updates, alpha=1.0 - beta3)
+            torch._foreach_add_(exp_avg_res_list, res_list, alpha=one_minus_beta3)
 
-            # final_update = exp_avg / (sqrt(exp_avg_res) + eps2)
-            # Copy exp_avg_res into scratch, then sqrt in-place to preserve exp_avg_res state
-            for i in range(len(pre_momentum_updates)):
-                pre_momentum_updates[i].copy_(exp_avg_res_list[i])
-            torch._foreach_sqrt_(pre_momentum_updates)
-            torch._foreach_add_(pre_momentum_updates, group['eps2'])
-            # Reciprocal in-place then multiply by exp_avg to avoid _foreach_div allocation
-            torch._foreach_pow_(pre_momentum_updates, -1.0)
-            torch._foreach_mul_(pre_momentum_updates, exp_avg_list)
-            final_update_list = pre_momentum_updates
-        else:
-            # update = exp_avg (no confidence)
-            final_update_list = exp_avg_list
+        # 7. Final update in update_list (its own buffers: exp_avg stays the stored first moment)
+        for _i in range(len(update_list)):
+            update_list[_i].copy_(exp_avg_list[_i])
+        if nfc:
+            # final_update = exp_avg / (sqrt(exp_avg_res) + eps2); the scratch now holds the denominator
+            for _i in range(len(res_list)):
+                res_list[_i].copy_(exp_avg_res_list[_i])
+            torch._foreach_sqrt_(res_list)
+            torch._foreach_add_(res_list, group['eps2'])
+            torch._foreach_div_(update_list, res_list)
+        final_update_list = update_list
 
-        # 6. Weight decay (inlined foreach variant — mirrors _core_unfactored_full_fp32)
+        # 8. Weight decay (inlined foreach variant — mirrors _core_unfactored_full_fp32)
         if cwd:
             # Cautious weight decay: apply WD only where gradient and param agree in sign
-            wd_scaled = wd * lr
+            wd_scaled = float(_fp32(wd) * _fp32(lr))
             for i in range(len(p_fp32_list)):
                 cwd_mask = (grad_list[i] * p_fp32_list[i] >= 0).to(p_fp32_list[i].dtype)
                 p_fp32_list[i].mul_(1.0 - wd_scaled * cwd_mask)
         elif wd_decouple:
-            wd_factor = 1.0 if fixed_decay else lr
-            torch._foreach_mul_(p_fp32_list, 1.0 - wd * wd_factor)
-        elif wd > 0.0:
+            wd_factor = 1.0 if fixed_decay else _fp32(lr)
+            torch._foreach_mul_(p_fp32_list, float(1.0 - _fp32(wd) * wd_factor))
+        else:
             # Standard (non-decoupled) weight decay: add scaled parameter to gradient
-            torch._foreach_add_(grad_list, p_fp32_list, alpha=wd)
+            torch._foreach_add_(grad_list, p_fp32_list, alpha=float(_fp32(wd)))
 
-        # 7. LR scale
+        # 9. LR scale
         torch._foreach_mul_(final_update_list, lr)
 
-        # 8. Update strategy (inlined foreach variant — mirrors _core_unfactored_full_fp32)
+        # 10. Update strategy (inlined foreach variant — mirrors _core_unfactored_full_fp32)
         if update_strategy in ('cautious', 'both'):
             # Cautious: mask = (update * grad > 0), normalized by mean
             mask_list = []
@@ -876,21 +877,12 @@ class CAME(BaseOptimizer):
                 mask_list.append(mask)
             torch._foreach_mul_(final_update_list, mask_list)
         if update_strategy in ('grams', 'both'):
-            # Grams: update = sign(grad) * |update|
-            # In-place variant: 1N allocations (sign) instead of 3N when nfc=True,
-            # or 2N instead of 3N when nfc=False (abs list + in-place mul).
-            sign_list = torch._foreach_sign(grad_list)  # N allocs (unavoidable — can't in-place on grad_list)
-            if nfc:
-                # Safe to mutate in-place: final_update_list points to pre_momentum scratch buffers
-                torch._foreach_abs_(final_update_list)
-                torch._foreach_mul_(final_update_list, sign_list)
-            else:
-                # Can't mutate in-place: final_update_list aliases exp_avg_list (optimizer state)
-                abs_list = torch._foreach_abs(final_update_list)  # N allocs
-                torch._foreach_mul_(abs_list, sign_list)  # in-place on abs_list
-                final_update_list = abs_list
+            # Grams: update = sign(grad) * |update| (in place: final_update_list never aliases optimizer state)
+            sign_list = torch._foreach_sign(grad_list)
+            torch._foreach_abs_(final_update_list)
+            torch._foreach_mul_(final_update_list, sign_list)
 
-        # 9. Apply: p -= update
+        # 11. Apply: p -= update
         torch._foreach_add_(p_fp32_list, final_update_list, alpha=-1.0)
 
         # ---- Write-back phase with sync chunking ----
@@ -1019,6 +1011,20 @@ class CAME(BaseOptimizer):
                         continue
                     grad_shape = p.grad.shape
                     if not self.get_options(grad_shape) and p.numel() >= 16:
+                        if p.grad.is_sparse:
+                            raise NoSparseGradientError(str(self))
+                        # The foreach step reads the state, so it is created here (the per-parameter loop below
+                        # skips these parameters and never gets to its own initialization).
+                        state = self.state[p]
+                        if len(state) == 0:
+                            self._init_param_state(p, group, grad_shape, False)
+                        elif nfc and 'exp_avg_res' not in state:
+                            # As in the per-parameter path: state created without non_factored_confidence
+                            state['exp_avg_res'] = torch.zeros_like(
+                                p.grad, dtype=torch.float32, device=self.state_storage_device
+                            )
+                            if self.state_storage_device == "cpu":
+                                state['exp_avg_res'] = state['exp_avg_res'].pin_memory()
                         unfactored_foreach_params.append(p)
                         if compute_device_for_foreach is None:
                             first_device = p.device

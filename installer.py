@@ -3,7 +3,6 @@ from pathlib import Path
 import sys
 import subprocess
 import os
-import shutil
 
 from install_uv import (ensure_uv, create_venv, uv_pip_install, get_venv_python_version, get_venv_python,
                         find_existing_venv)
@@ -28,42 +27,64 @@ def check_git_install() -> bool:
         return False
     return True
 
-def setup_accelerate(platform: str) -> None:
-    if platform == "windows":
-        path = Path(f"{os.environ['USERPROFILE']}")
-    else:
-        path = Path.home()
-    path = path.joinpath(".cache/huggingface/accelerate/default_config.yaml")
-    if path.exists():
-        logger.info("Default accelerate config already exists, skipping.")
-        return
-    if not path.parent.exists():
-        path.parent.mkdir(parents=True)
-    with open("default_config.yaml", "w") as f:
-        f.write("command_file: null\n")
-        f.write("commands: null\n")
-        f.write("compute_environment: LOCAL_MACHINE\n")
-        f.write("deepspeed_config: {}\n")
-        f.write("distributed_type: 'NO'\n")
-        f.write("downcase_fp16: 'NO'\n")
-        f.write("dynamo_backend: 'NO'\n")
-        f.write("fsdp_config: {}\n")
-        f.write("gpu_ids: '0'\n")
-        f.write("machine_rank: 0\n")
-        f.write("main_process_ip: null\n")
-        f.write("main_process_port: null\n")
-        f.write("main_training_function: main\n")
-        f.write("megatron_lm_config: {}\n")
-        f.write("mixed_precision: bf16\n")
-        f.write("num_machines: 1\n")
-        f.write("num_processes: 1\n")
-        f.write("rdzv_backend: static\n")
-        f.write("same_network: true\n")
-        f.write("tpu_name: null\n")
-        f.write("tpu_zone: null\n")
-        f.write("use_cpu: false")
+# The default Accelerate config for a new install: single process, bf16. Only keys Accelerate's config loader knows
+# (it stops on any other key with "unknown keys", and 'accelerate launch' then never starts); the unused TPU-pod
+# entries are left out (their defaults are the same). Multi-GPU runs pass --multi_gpu / --gpu_ids at launch time.
+ACCELERATE_CONFIG = """compute_environment: LOCAL_MACHINE
+deepspeed_config: {}
+distributed_type: 'NO'
+dynamo_backend: 'NO'
+fsdp_config: {}
+gpu_ids: '0'
+machine_rank: 0
+main_process_ip: null
+main_process_port: null
+main_training_function: main
+megatron_lm_config: {}
+mixed_precision: bf16
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+use_cpu: false
+"""
 
-    shutil.move("default_config.yaml", str(path.resolve()))
+# Keys an older version of this installer wrote by mistake (a typo of downcast_bf16) and Accelerate rejects: removed
+# from an existing default config, which is otherwise never touched.
+INVALID_ACCELERATE_KEYS = ("downcase_fp16",)
+
+
+def accelerate_config_path(platform: str) -> Path:
+    home = Path(os.environ["USERPROFILE"]) if platform == "windows" else Path.home()
+    return home.joinpath(".cache/huggingface/accelerate/default_config.yaml")
+
+
+def repair_accelerate_config(path: Path) -> list:
+    """Remove INVALID_ACCELERATE_KEYS lines from an existing config; returns the keys removed."""
+    text = path.read_bytes().decode("utf-8")
+    kept, removed = [], []
+    for line in text.splitlines(keepends=True):
+        key = line.split(":", 1)[0].strip()
+        if ":" in line and not line[:1].isspace() and key in INVALID_ACCELERATE_KEYS:
+            removed.append(key)
+            continue
+        kept.append(line)
+    if removed:
+        path.write_bytes("".join(kept).encode("utf-8"))
+    return removed
+
+
+def setup_accelerate(platform: str, path: Path | None = None) -> None:
+    path = path or accelerate_config_path(platform)
+    if path.exists():
+        removed = repair_accelerate_config(path)
+        if removed:
+            logger.warning(f"Removed {', '.join(removed)} from {path}: Accelerate rejects it")
+        else:
+            logger.info("Default accelerate config already exists, skipping.")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(ACCELERATE_CONFIG, encoding="utf-8")
 
 
 # flash-attention wheel URLs for each platform/python combination (torch 2.7 profile)

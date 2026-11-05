@@ -5,6 +5,12 @@ from library.train_util import BucketManager
 from PIL import Image
 import math
 from LoraEasyCustomOptimizer import OPTIMIZERS
+from utils.caption_tags import (
+    DEFAULT_CAPTION_EXTENSION,
+    caption_extension_errors,
+    count_tags,
+    wants_tag_count,
+)
 from utils.model_args import (
     detect_models,
     drop_gui_only_keys,
@@ -14,6 +20,7 @@ from utils.model_args import (
     text_encoder_cache_errors,
     tokenizer_errors,
 )
+from utils.schedule_args import apply_restart_cycles, apply_warmup_ratio
 
 
 def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
@@ -26,8 +33,13 @@ def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
         return False, False, over_errors, {}, {}
     args_pass, args_errors, args_data = validate_args(args["args"])
     dataset_pass, dataset_errors, dataset_data = validate_dataset_args(args["dataset"])
-    over_pass = args_pass and dataset_pass
-    over_errors = args_errors + dataset_errors
+    # caption files are text files: a config / key file is never read as captions (or returned as tags);
+    # the request's own subsets still carry their names
+    caption_errors = caption_extension_errors(
+        {"general": dataset_data["general"], "subsets": args["dataset"].get("subsets") or []}
+    )
+    over_pass = args_pass and dataset_pass and not caption_errors
+    over_errors = args_errors + dataset_errors + caption_errors
 
     # Process log prefix mode regardless of initial pass status, but add errors if needed
     if "log_prefix_mode" in args_data:
@@ -78,7 +90,9 @@ def validate(args: dict) -> tuple[bool, bool, list[str], dict, dict]:
     if not over_errors:
         validate_warmup_ratio(args_data, dataset_data, num_processes)
         validate_restarts(args_data, dataset_data, num_processes)
-        tag_data = validate_save_tags(dataset_data)
+        # the captions' text goes back to the requester only when it asked for the tag count file
+        if wants_tag_count(args["args"]):
+            tag_data = validate_save_tags(dataset_data)
         validate_existing_files(args_data)
         validate_optimizer(args_data)
     sdxl = validate_sdxl(args_data)
@@ -263,6 +277,9 @@ def validate_subset(args: dict) -> tuple[bool, list[str], dict]:
     if "image_dir" not in output_args or not Path(output_args["image_dir"]).exists():
         passed_validation = False
         errors.append(f"Image directory path for '{name}' does not exist")
+    elif not Path(output_args["image_dir"]).is_dir():
+        passed_validation = False
+        errors.append(f"Image directory path for '{name}' is not a folder")
     else:
         output_args["image_dir"] = Path(output_args["image_dir"]).as_posix()
         
@@ -272,43 +289,25 @@ def validate_subset(args: dict) -> tuple[bool, list[str], dict]:
     return passed_validation, errors, output_args
 
 
-def validate_restarts(args: dict, dataset: dict, num_processes: int = 1) -> None:
-    if "lr_scheduler_num_cycles" not in args:
-        return
-    if "lr_scheduler_type" not in args:
-        return
+def estimated_steps(args: dict, dataset: dict, num_processes: int = 1) -> int:
+    """The backend's estimate of the update count (the trainer's real count can differ, see utils/schedule_args.py)."""
     if "max_train_steps" in args:
-        steps = args["max_train_steps"]
-    else:
-        steps = calculate_steps(
-            dataset,
-            args["max_train_epochs"],
-            args.get("gradient_accumulation_steps", 1),
-            num_processes,
-        )
-    steps = steps // args["lr_scheduler_num_cycles"]
-    args["lr_scheduler_args"].append(f"first_cycle_max_steps={steps}")
-    #del args["lr_scheduler_num_cycles"]
+        return args["max_train_steps"]
+    return calculate_steps(
+        dataset,
+        args["max_train_epochs"],
+        args.get("gradient_accumulation_steps", 1),
+        num_processes,
+    )
+
+
+def validate_restarts(args: dict, dataset: dict, num_processes: int = 1) -> None:
+    apply_restart_cycles(args, lambda: estimated_steps(args, dataset, num_processes))
 
 
 def validate_warmup_ratio(args: dict, dataset: dict, num_processes: int = 1) -> None:
-    if "warmup_ratio" not in args:
-        return
-    if "max_train_steps" in args:
-        steps = args["max_train_steps"]
-    else:
-        steps = calculate_steps(
-            dataset,
-            args["max_train_epochs"],
-            args.get("gradient_accumulation_steps", 1),
-            num_processes,
-        )
-    steps = round(steps * args["warmup_ratio"])
-    if "lr_scheduler_type" in args:
-        args["lr_scheduler_args"].append(f"warmup_steps={steps // args.get('lr_scheduler_num_cycles', 1)}")
-    else:
-        args["lr_warmup_steps"] = steps
-    del args["warmup_ratio"]
+    # default schedulers get the ratio (the trainer converts it with its real step count), custom ones the estimate
+    apply_warmup_ratio(args, lambda: estimated_steps(args, dataset, num_processes))
 
 
 def validate_existing_files(args: dict) -> None:
@@ -330,20 +329,9 @@ def validate_sdxl(args: dict) -> bool:
 
 
 def validate_save_tags(dataset: dict) -> dict:
-    tags = {}
-    for subset in dataset["subsets"]:
-        if 'is_val' in subset and subset['is_val']:
-            continue
-        subset_dir = Path(subset["image_dir"])
-        if not subset_dir.is_dir():
-            continue
-        for file in subset_dir.iterdir():
-            if not file.is_file():
-                continue
-            if file.suffix != subset["caption_extension"]:
-                continue
-            get_tags_from_file(subset_dir.joinpath(file.name), tags)
-    return dict(sorted(tags.items(), key=lambda item: item[1], reverse=True))
+    """Tag counts of the training captions (utils/caption_tags.py: caption text files beside the images only)."""
+    default_extension = dataset.get("general", {}).get("caption_extension") or DEFAULT_CAPTION_EXTENSION
+    return count_tags(dataset["subsets"], default_extension)
 
 
 def validate_optimizer(args: dict) -> None:
@@ -353,16 +341,6 @@ def validate_optimizer(args: dict) -> None:
         args["optimizer_type"] = f"{OPTIMIZERS[opt_type_lower].__module__}.{OPTIMIZERS[opt_type_lower].__qualname__}"
         return
     
-
-
-def get_tags_from_file(file: str, tags: dict) -> None:
-    with open(file, "r", encoding="utf-8") as f:
-        temp = f.read().replace(", ", ",").split(",")
-        for tag in temp:
-            if tag in tags:
-                tags[tag] += 1
-            else:
-                tags[tag] = 1
 
 
 def calculate_steps(
