@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -24,6 +25,10 @@ from transformers import CLIPTokenizer
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torchao")
 logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
+
+# Seconds a tunnel gets to relay the /train answer it already holds before /train closes it (asyncio.sleep, so the
+# event loop keeps serving meanwhile).
+TUNNEL_CLOSE_DELAY = 1.5
 
 try:
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
@@ -158,6 +163,7 @@ async def start_training(request: Request) -> JSONResponse:
         # Colab trains in the notebook once this server exits. Answer first (the GUI now treats a non-200 /train as
         # "did not start" and keeps the queue item), then close the tunnel and the server after the response is sent.
         async def _colab_shutdown() -> None:
+            await asyncio.sleep(TUNNEL_CLOSE_DELAY)
             await kill_tunnel_service()
             await stop_server()
 
@@ -235,17 +241,23 @@ async def start_training(request: Request) -> JSONResponse:
         print(f"Launching with accelerate: {accelerate_num_processes} processes")
 
     app.state.TRAINING_THREAD = subprocess.Popen(cmd)
+    close_tunnel = None
     if (
         "kill_tunnel_on_train_start" in server_config_dict
         and server_config_dict["kill_tunnel_on_train_start"]
         and app.state.TUNNEL
     ):
-        app.state.TUNNEL.kill_service()
-        app.state.TUNNEL = None
+        # The answer travels through the tunnel: close it after the response is sent, not before (the GUI reads a
+        # dropped /train answer as "start unknown" and stops its queue).
+        async def _close_tunnel() -> None:
+            await asyncio.sleep(TUNNEL_CLOSE_DELAY)
+            await kill_tunnel_service()
+
+        close_tunnel = BackgroundTask(_close_tunnel)
     if "kill_server_on_train_end" in server_config_dict and server_config_dict["kill_server_on_train_end"]:
         app.state.MONITOR_THREAD = Thread(target=monitor_training_thread, daemon=True)
         app.state.MONITOR_THREAD.start()
-    return JSONResponse({"detail": "Training Started", "training": True})
+    return JSONResponse({"detail": "Training Started", "training": True}, background=close_tunnel)
 
 
 async def stop_training(request: Request) -> JSONResponse:

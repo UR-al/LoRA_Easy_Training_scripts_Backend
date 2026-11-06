@@ -6,7 +6,9 @@ tests/test_security.py and tests/test_launch.py cover the helpers; these import 
 - binds 127.0.0.1 by default and registers the request guard (a foreign Host header gets 403);
 - refuses /start_tunnel_service without a token;
 - with a token, binds the configured host and needs 'Authorization: Bearer <token>';
-- answers bad multi-GPU settings of /train with 400 and builds the launch from the default Accelerate config.
+- answers bad multi-GPU settings of /train with 400 and builds the launch from the default Accelerate config;
+- with kill_tunnel_on_train_start (and on Colab), answers /train before it closes the tunnel the answer travels
+  through, and only after TUNNEL_CLOSE_DELAY, so the tunnel can relay the answer it already holds.
 Nothing listens on a port, no tunnel and no training process starts (Popen and create_tunnel are replaced in the
 child), the child runs offline and without GPUs.
 
@@ -34,9 +36,11 @@ HAS_BACKEND = all(
     for name in ("library", "LoraEasyCustomOptimizer", "PIL", "starlette", "httpx", "uvicorn", "transformers")
 )
 TOKEN = "test-token-1234"
+TEST_CLOSE_DELAY = 0.3  # main.TUNNEL_CLOSE_DELAY in the child, so the tests that close a tunnel stay quick
+TIMER_SLACK = 0.05  # Windows timers may fire this much early
 
 DRIVER = r"""
-import json, subprocess, sys
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 backend, workdir, mode, *token = sys.argv[1:]
@@ -45,6 +49,12 @@ sys.argv = [str(Path(backend, "main.py")), workdir]  # python main.py <workdir>
 import main  # exits with the refusal, or sets the app up (server.run() is only for __main__)
 
 launched, tunnels = [], []
+# [name, time.monotonic()] of the training start, the response messages and the tunnel close (colab, kill_tunnel)
+events = []
+
+
+def record_event(name):
+    events.append([name, time.monotonic()])
 
 
 class NotStarted:
@@ -57,6 +67,7 @@ class NotStarted:
 
 def popen(cmd, *args, **kwargs):
     launched.append([str(part) for part in cmd])
+    record_event("popen")
     return NotStarted()
 
 
@@ -71,6 +82,33 @@ main.create_tunnel = create_tunnel
 from starlette.testclient import TestClient
 
 client = TestClient(main.app, base_url="http://127.0.0.1:8000", raise_server_exceptions=False)
+
+
+class FakeTunnel:
+    def kill_service(self):
+        record_event("kill_service")
+
+
+def recording(asgi_app):
+    # records the response messages main.app sends, so the tunnel close can be ordered and timed against them
+    async def wrapped(scope, receive, send):
+        async def record(message):
+            if message["type"].startswith("http.response"):
+                record_event(message["type"])
+            await send(message)
+
+        await asgi_app(scope, receive, record)
+
+    return wrapped
+
+
+def with_fake_tunnel():
+    # the tunnel the /train answer travels through; a short close delay keeps the test quick (read when the task runs)
+    global client
+    results["shipped_close_delay"] = main.TUNNEL_CLOSE_DELAY
+    main.TUNNEL_CLOSE_DELAY = float(os.environ["TEST_CLOSE_DELAY"])
+    main.app.state.TUNNEL = FakeTunnel()
+    client = TestClient(recording(main.app), base_url="http://127.0.0.1:8000", raise_server_exceptions=False)
 
 
 def get(path, **kwargs):
@@ -88,8 +126,18 @@ if mode == "token":
     results["wrong"] = get("/is_training", headers={"Authorization": "Bearer nope"})
     results["bearer"] = get("/is_training", headers={"Authorization": "Bearer " + token[0]})
 elif mode == "colab":
+    with_fake_tunnel()
     results["colab_train"] = get("/train")
     results["should_exit"] = bool(main.server.should_exit)
+    results["tunnel_closed"] = main.app.state.TUNNEL is None
+    results["events"] = events
+elif mode == "kill_tunnel":
+    with_fake_tunnel()
+    Path("runtime_store/config.toml").write_text("", encoding="utf-8")  # as left by a /validate
+    Path("runtime_store/dataset.toml").write_text("", encoding="utf-8")
+    results["train"] = get("/train")
+    results["tunnel_closed"] = main.app.state.TUNNEL is None
+    results["events"] = events
 else:
     results["stop_idle"] = get("/stop_training")
     results["is_training"] = get("/is_training")
@@ -134,6 +182,7 @@ class MainWiringTest(unittest.TestCase):
             "CUDA_VISIBLE_DEVICES": "-1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
+            "TEST_CLOSE_DELAY": str(TEST_CLOSE_DELAY),
         })
         if token:
             env[TOKEN_ENV] = token
@@ -198,6 +247,29 @@ class MainWiringTest(unittest.TestCase):
         self.assertTrue(body["training"])
         self.assertTrue(result["should_exit"])  # the shutdown still ran, after the response
         self.assertEqual(result["launched"], [])
+        self.assertEqual([name for name, _ in result["events"]],
+                         ["http.response.start", "http.response.body", "kill_service"])
+        self.assertTrue(result["tunnel_closed"])
+        self.assert_tunnel_closes_after_the_delay(result)
+
+    def test_train_answers_before_it_closes_the_tunnel(self):
+        # the answer travels through the tunnel: closing it first dropped the 200 and the GUI saw "start unknown"
+        config = {"kill_tunnel_on_train_start": True, "remote": False, "port": 8000}
+        done, result = self.run_main(config, mode="kill_tunnel")
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(result["train"], [200, {"detail": "Training Started", "training": True}])
+        self.assertEqual(len(result["launched"]), 1, result["launched"])
+        self.assertEqual([name for name, _ in result["events"]],
+                         ["popen", "http.response.start", "http.response.body", "kill_service"])
+        self.assertTrue(result["tunnel_closed"])
+        self.assert_tunnel_closes_after_the_delay(result)
+
+    def assert_tunnel_closes_after_the_delay(self, result):
+        # the answer being sent is not enough: closing the tunnel right after the last write can still drop the bytes
+        # cloudflared or ngrok holds, so the tunnel must get main.TUNNEL_CLOSE_DELAY to relay them
+        self.assertGreater(result["shipped_close_delay"], 0)
+        times = dict(result["events"])
+        self.assertGreaterEqual(times["kill_service"] - times["http.response.body"], TEST_CLOSE_DELAY - TIMER_SLACK)
 
 
 if __name__ == "__main__":

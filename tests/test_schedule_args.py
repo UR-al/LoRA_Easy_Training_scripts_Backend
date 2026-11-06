@@ -26,9 +26,10 @@ def no_estimate():
 
 
 def trainer_warmup_steps(lr_warmup_steps, num_training_steps: int) -> int:
-    """library/train_util.get_scheduler_fix: a float is a ratio of the trainer's own step count."""
+    """library/train_util.get_scheduler_fix: a float is a ratio of the trainer's own step count, turned into steps by
+    fraction_to_steps (the floor of ratio * steps after rounding away float noise)."""
     if isinstance(lr_warmup_steps, float):
-        return int(lr_warmup_steps * num_training_steps)
+        return int(round(lr_warmup_steps * num_training_steps, 6))
     return lr_warmup_steps
 
 
@@ -41,6 +42,13 @@ class WarmupRatioTest(unittest.TestCase):
         self.assertEqual(args["lr_warmup_steps"], 0.1)
         # the reviewer's dataset: the trainer counts 80 updates, so the warmup is 8 steps (the GUI's 20 gave 2)
         self.assertEqual(trainer_warmup_steps(args["lr_warmup_steps"], 80), 8)
+
+    def test_float_noise_does_not_lose_a_step(self):
+        # 0.29 * 100 = 28.999999999999996: a plain int() gave 28
+        args = {"warmup_ratio": 0.29, "lr_scheduler": "cosine"}
+        apply_warmup_ratio(args, no_estimate)
+        self.assertEqual(args["lr_warmup_steps"], 0.29)
+        self.assertEqual(trainer_warmup_steps(args["lr_warmup_steps"], 100), 29)
 
     def test_whole_number_ratio_stays_a_ratio(self):
         args = {"warmup_ratio": 1, "lr_scheduler": "linear"}
@@ -56,7 +64,8 @@ class WarmupRatioTest(unittest.TestCase):
         self.assertEqual(args["lr_scheduler_num_cycles"], 3)
 
     def test_custom_scheduler_gets_the_ratio_as_a_float(self):
-        # the trainer (get_scheduler_fix) turns warmup_steps=<float> into int(0.1 * steps) // cycles = 4 for 80 steps
+        # the trainer (get_scheduler_fix) turns warmup_steps=<float> into fraction_to_steps(0.1, steps) // cycles,
+        # 8 // 2 = 4 for 80 steps
         args = {"warmup_ratio": 0.1, "lr_scheduler_type": "LoraEasyCustomOptimizer.X.X", "lr_scheduler_num_cycles": 2,
                 "lr_scheduler_args": ["min_lr=1e-06"]}
         apply_warmup_ratio(args, no_estimate)
