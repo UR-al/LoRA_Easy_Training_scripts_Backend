@@ -14,7 +14,7 @@ child), the child runs offline and without GPUs.
 
 Run from the backend folder with the training venv (skipped without the backend's packages):
 
-    sd_scripts\\venv\\Scripts\\python -m unittest tests.test_main_wiring
+    sd_scripts\\venv_t214\\Scripts\\python -m unittest tests.test_main_wiring
 """
 
 import importlib.util

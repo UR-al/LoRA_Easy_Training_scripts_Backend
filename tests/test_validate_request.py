@@ -8,7 +8,7 @@ warmup ratio goes to the trainer as a ratio for a default scheduler.
 Run from the backend folder with the training venv (validation.py imports sd-scripts' library, torch and the custom
 optimizers; the test is skipped without them):
 
-    sd_scripts\\venv\\Scripts\\python -m unittest tests.test_validate_request
+    sd_scripts\\venv_t214\\Scripts\\python -m unittest tests.test_validate_request
 """
 
 import copy

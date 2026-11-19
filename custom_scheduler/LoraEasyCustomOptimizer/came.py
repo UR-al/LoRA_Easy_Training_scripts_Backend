@@ -51,6 +51,14 @@ class CAME(BaseOptimizer):
         Tracks rounding error from each low-precision write-back and compensates in the next step,
         preventing small gradient updates from being lost to rounding. Only applies to bf16/fp16 parameters.
         (default: False)
+    :param group_shapes: bool: Process factored (2D+) parameters of the same shape together: stack them, run the
+        factored step once per shape with per-parameter reductions (row/col means, RMS clip, cautious mask mean,
+        weight decay), and write the results back. Same math per parameter; only the summation order inside some
+        reductions can differ (ulp level). State format is unchanged. Covers fp32 parameters with fp32 state on the
+        parameter's CUDA device; everything else (bf16/fp16 params, Kahan, bf16 or CPU state storage) keeps the
+        per-parameter path. (default: False)
+    :param group_shapes_max_numel: int: Upper bound on elements per stacked chunk (transient VRAM, per fp32 buffer
+        ~4 bytes x this). (default: 2**25)
     """
 
     def __init__(
@@ -75,6 +83,8 @@ class CAME(BaseOptimizer):
         foreach: bool = False,
         non_factored_confidence: bool = False,
         kahan_sum: bool = False,
+        group_shapes: bool = False,
+        group_shapes_max_numel: int = 1 << 25,
         **kwargs,
     ):
         self.validate_learning_rate(lr)
@@ -139,6 +149,23 @@ class CAME(BaseOptimizer):
         # Compiled step callables (lazily compiled on first step() call)
         self._compiled_factored = None
         self._compiled_unfactored = None
+
+        # 2026-11-14 shape batching (opt-in). Kept as instance attributes, NOT in `defaults`: a defaults key would add a
+        # key to every saved param group (state format change), and torch's load_state_dict replaces the group dicts
+        # with the saved ones, so a resume from an older state would silently drop the flag.
+        # [review fix 3] sd-scripts hands optimizer_args it cannot literal_eval over as strings ("false", "off"): bool()
+        # of those is True, which would switch the opt-in path ON for someone who wrote group_shapes=false.
+        if isinstance(group_shapes, str):
+            _flag = group_shapes.strip().lower()
+            if _flag not in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+                raise ValueError(f"group_shapes must be True or False, got {group_shapes!r}")
+            group_shapes = _flag in ("true", "1", "yes", "on")
+        self.group_shapes = bool(group_shapes)
+        self.group_shapes_max_numel = max(1, int(group_shapes_max_numel))
+        self._compiled_grouped = None
+        # [review fix 1] (G, shape, flags) keys handed to the compiled grouped core; see _grouped_factored_step
+        self._grouped_graph_keys: set = set()
+        self._grouped_compile_off = False
 
         defaults: Defaults = {
             'lr': lr,
@@ -341,6 +368,7 @@ class CAME(BaseOptimizer):
         use_cautious: bool,
         use_grams: bool,
         p_fp32: torch.Tensor,
+        alphas=None,
     ) -> None:
         r"""Core factored per-parameter step INCLUDING weight decay, LR scale, update strategy, and param update.
 
@@ -353,8 +381,11 @@ class CAME(BaseOptimizer):
         update = torch.mul(grad, grad).add_(eps1)
 
         # Factored second moment EMA
-        exp_avg_sq_row.mul_(beta2).add_(update.mean(dim=-1), alpha=1.0 - beta2)
-        exp_avg_sq_col.mul_(beta2).add_(update.mean(dim=-2), alpha=1.0 - beta2)
+        # alphas: (1-beta1, 1-beta2, 1-beta3) as host floats on the eager path (a 0-dim CUDA tensor as alpha costs a
+        # blocking .item() each); None on the compiled path, where the tensors are traced. Same fp32 values either way.
+        a1, a2, a3 = (1.0 - beta1, 1.0 - beta2, 1.0 - beta3) if alphas is None else alphas
+        exp_avg_sq_row.mul_(beta2).add_(update.mean(dim=-1), alpha=a2)
+        exp_avg_sq_col.mul_(beta2).add_(update.mean(dim=-2), alpha=a2)
 
         # Approximate sq grad as denominator
         r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
@@ -375,14 +406,14 @@ class CAME(BaseOptimizer):
         update.div_(clip_factor)
 
         # Momentum
-        exp_avg.mul_(beta1).add_(update, alpha=1.0 - beta1)
+        exp_avg.mul_(beta1).add_(update, alpha=a1)
 
         # Confidence (residual)
         res = update - exp_avg
         res.pow_(2).add_(eps2)
 
-        exp_avg_res_row.mul_(beta3).add_(res.mean(dim=-1), alpha=1.0 - beta3)
-        exp_avg_res_col.mul_(beta3).add_(res.mean(dim=-2), alpha=1.0 - beta3)
+        exp_avg_res_row.mul_(beta3).add_(res.mean(dim=-1), alpha=a3)
+        exp_avg_res_col.mul_(beta3).add_(res.mean(dim=-2), alpha=a3)
 
         # Approximate sq grad for confidence modulation
         r_factor_res = (exp_avg_res_row / exp_avg_res_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
@@ -418,6 +449,98 @@ class CAME(BaseOptimizer):
 
     @staticmethod
     @torch.no_grad()
+    def _core_factored_grouped_fp32(
+        grad: torch.Tensor,
+        exp_avg: torch.Tensor,
+        exp_avg_sq_row: torch.Tensor,
+        exp_avg_sq_col: torch.Tensor,
+        exp_avg_res_row: torch.Tensor,
+        exp_avg_res_col: torch.Tensor,
+        exp_avg_sq_hat: torch.Tensor,
+        beta1: torch.Tensor,
+        beta2: torch.Tensor,
+        beta3: torch.Tensor,
+        eps1: torch.Tensor,
+        eps2: torch.Tensor,
+        clip_threshold: torch.Tensor,
+        use_amsbound: bool,
+        lr: torch.Tensor,
+        weight_decay: torch.Tensor,
+        weight_decouple: bool,
+        fixed_decay: bool,
+        cautious_weight_decay: bool,
+        use_cautious: bool,
+        use_grams: bool,
+        p_fp32: torch.Tensor,
+        alphas=None,
+    ) -> None:
+        r"""_core_factored_full_fp32 for G same-shape parameters stacked on a new leading dim (group_shapes, 11-14).
+
+        Line for line the same operations; the two whole-parameter reductions (RMS norm, cautious mask mean) become
+        reductions over every dim but the leading one, and the row/col means already act on the trailing dims. The
+        elementwise results are therefore identical per element; only reductions whose CUDA kernel picks a different
+        split for G outputs instead of 1 can round differently (the 0/1 mask sum is exact either way).
+        """
+        red = tuple(range(1, grad.dim()))       # the dims of ONE parameter
+        numel = math.prod(grad.shape[1:])       # static under dynamic=False
+
+        update = torch.mul(grad, grad).add_(eps1)
+
+        a1, a2, a3 = (1.0 - beta1, 1.0 - beta2, 1.0 - beta3) if alphas is None else alphas
+        exp_avg_sq_row.mul_(beta2).add_(update.mean(dim=-1), alpha=a2)
+        exp_avg_sq_col.mul_(beta2).add_(update.mean(dim=-2), alpha=a2)
+
+        r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+        c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
+        torch.mul(r_factor, c_factor, out=update)
+
+        if use_amsbound:
+            torch.max(exp_avg_sq_hat, 1.0 / update, out=exp_avg_sq_hat)
+            torch.rsqrt(exp_avg_sq_hat / beta2, out=update)
+
+        update.mul_(grad)
+
+        # RMS clip per parameter: (G, 1, ..., 1) factors
+        rms = torch.linalg.vector_norm(update, 2, dim=red, keepdim=True) / math.sqrt(numel)
+        clip_factor = (rms / clip_threshold).clamp_(min=1.0)
+        update.div_(clip_factor)
+
+        exp_avg.mul_(beta1).add_(update, alpha=a1)
+
+        res = update - exp_avg
+        res.pow_(2).add_(eps2)
+
+        exp_avg_res_row.mul_(beta3).add_(res.mean(dim=-1), alpha=a3)
+        exp_avg_res_col.mul_(beta3).add_(res.mean(dim=-2), alpha=a3)
+
+        r_factor_res = (exp_avg_res_row / exp_avg_res_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+        c_factor_res = exp_avg_res_col.unsqueeze(-2).rsqrt()
+        torch.mul(r_factor_res, c_factor_res, out=update)
+        update.mul_(exp_avg)
+
+        if cautious_weight_decay:
+            cwd_mask = (grad * p_fp32 >= 0).to(p_fp32.dtype)
+            p_fp32.mul_(1.0 - weight_decay * lr * cwd_mask)
+        elif weight_decouple:
+            wd_factor = 1.0 if fixed_decay else lr
+            p_fp32.mul_(1.0 - weight_decay * wd_factor)
+        else:
+            grad.add_(p_fp32, alpha=weight_decay)
+
+        update.mul_(lr)
+
+        if use_cautious:
+            # cautious mask mean per parameter
+            mask = (update * grad > 0).to(grad.dtype)
+            mask.div_(mask.mean(dim=red, keepdim=True).clamp_(min=1e-3))
+            update.mul_(mask)
+        if use_grams:
+            update.copy_(torch.sign(grad) * update.abs())
+
+        p_fp32.add_(-update)
+
+    @staticmethod
+    @torch.no_grad()
     def _core_unfactored_full_fp32(
         grad: torch.Tensor,
         exp_avg: torch.Tensor,
@@ -440,6 +563,7 @@ class CAME(BaseOptimizer):
         use_cautious: bool,
         use_grams: bool,
         p_fp32: torch.Tensor,
+        alphas=None,
     ) -> None:
         r"""Core unfactored per-parameter step INCLUDING confidence, weight decay, LR scale, update strategy, and param update.
 
@@ -451,7 +575,8 @@ class CAME(BaseOptimizer):
         update = torch.mul(grad, grad).add_(eps1)
 
         # EMA of squared gradient
-        exp_avg_sq.mul_(beta2).add_(update, alpha=1.0 - beta2)
+        a1, a2, a3 = (1.0 - beta1, 1.0 - beta2, 1.0 - beta3) if alphas is None else alphas
+        exp_avg_sq.mul_(beta2).add_(update, alpha=a2)
         torch.rsqrt(exp_avg_sq, out=update)
 
         # AMSBound
@@ -468,13 +593,13 @@ class CAME(BaseOptimizer):
         update.div_(clip_factor)
 
         # Momentum exp_avg = beta1*exp_avg + (1-beta1)*update
-        exp_avg.mul_(beta1).add_(update, alpha=1.0 - beta1)
+        exp_avg.mul_(beta1).add_(update, alpha=a1)
 
         # Non-factored confidence: apply residual modulation
         if use_nfc:
             # update still holds pre-momentum value; res = (pre - post)^2 + eps2
             res = update.sub(exp_avg).pow_(2).add_(eps2)
-            exp_avg_res.mul_(beta3).add_(res, alpha=1.0 - beta3)
+            exp_avg_res.mul_(beta3).add_(res, alpha=a3)
             # update = exp_avg / (sqrt(exp_avg_res) + eps2)
             update.copy_(exp_avg).div_(exp_avg_res.sqrt().add_(eps2))
         else:
@@ -551,6 +676,13 @@ class CAME(BaseOptimizer):
             }
         scalars = self._scalar_cache[key]
         betas = group['betas']
+        # Refill once per step() call (was: for every parameter, 8 fill_ each). Keyed on the step serial, NOT on the values:
+        # LyCORIS passes group['lr'] as a tensor that the LR scheduler updates IN PLACE, so a value comparison sees the same
+        # object and never refills (11-14 bug found by review: lr_t stayed at the warmup's 0 and nothing trained).
+        serial = getattr(self, '_step_serial', 0)
+        if scalars.get('_serial') == serial:
+            return scalars
+        scalars['_serial'] = serial
         scalars['beta1_t'].fill_(betas[0])
         scalars['beta2_t'].fill_(betas[1])
         scalars['beta3_t'].fill_(betas[2])
@@ -560,6 +692,17 @@ class CAME(BaseOptimizer):
         scalars['lr_t'].fill_(group['lr'])
         scalars['wd_t'].fill_(group['weight_decay'])
         return scalars
+
+    def _host_alphas(self, group: dict):
+        r"""(1-beta1, 1-beta2, 1-beta3) as Python floats, computed in float32 exactly like `1.0 - beta_t` on the device
+        (the value `.item()` returned before), cached per beta tuple. Used only on the eager core."""
+        # once per group per step() (betas could in principle be tensors changed in place, like lr - never cache by value)
+        key = (id(group), getattr(self, '_step_serial', 0))
+        cache = self.__dict__.setdefault('_host_alpha_cache', {})
+        if key not in cache:
+            cache.clear()
+            cache[key] = tuple(float(_fp32(1.0) - _fp32(float(b))) for b in group['betas'][:3])
+        return cache[key]
 
     def _get_empty_tensor(self, device: torch.device) -> torch.Tensor:
         r"""Get or create cached empty tensor for AMSBound placeholder."""
@@ -654,6 +797,185 @@ class CAME(BaseOptimizer):
         if self._srng_buf is None or self._srng_buf.device != like_tensor.device or self._srng_buf.numel() < n:
             self._srng_buf = torch.empty(n, dtype=torch.int32, device=like_tensor.device)
         return self._srng_buf[:n].view(like_tensor.shape)
+
+    # --- Shape-batched factored step (group_shapes, 2026-11-14) ---
+    # Why: the Anima LoKr+DoRA run has 1,920 2-D parameters in only 11 shapes; the per-parameter loop costs ~183 ms per
+    # optimizer step with compile_step (~905 ms eager), almost all of it launch / Python overhead on tiny tensors.
+
+    _GROUPED_STATE_KEYS = ('exp_avg', 'exp_avg_sq_row', 'exp_avg_sq_col', 'exp_avg_res_row', 'exp_avg_res_col')
+    _GROUPED_MAX_GRAPHS = 32  # [review fix 1] compiled (G, shape, flags) graphs of the grouped core; eager beyond
+
+    @staticmethod
+    def _grouped_compile_failures() -> tuple:
+        r"""Exceptions torch.compile raises BEFORE the graph runs (so the eager core can take the same inputs)."""
+        import torch._dynamo.exc as dynamo_exc
+        return (dynamo_exc.TorchDynamoException, dynamo_exc.FailOnRecompileLimitHit)
+
+    def _grouped_core_fn(self):
+        r"""The grouped core, compiled like the per-parameter one when compile_step is on. Every compiled
+        @torch.no_grad() function runs through the same frame (torch/_dynamo/external_utils.py inner), so by default its
+        graphs - one per (G, shape, flags) - would count against the recompile_limit of the per-parameter functions,
+        whose calls have no eager fallback (review 2, issue 1: 32 grouped graphs + 32 per-parameter ones = 64 stopped a
+        run with module dropout that flag off survives). isolate_recompiles=True (torch >= 2.14) gives the grouped core a
+        cache region of its own; _grouped_factored_step still caps it at _GROUPED_MAX_GRAPHS (review fix 1). Older torch
+        has no such argument: there the grouped graphs share the limit as before (warned once)."""
+        if self._compiled_grouped is None:
+            self._compiled_grouped = self._core_factored_grouped_fp32
+            if self._compiled_factored is not None and self._compiled_factored is not self._core_factored_full_fp32:
+                try:
+                    with torch._dynamo.utils.disable_cache_limit():
+                        try:
+                            self._compiled_grouped = torch.compile(
+                                self._core_factored_grouped_fp32, fullgraph=True, dynamic=False,
+                                isolate_recompiles=True,
+                            )
+                        except TypeError:
+                            logger.warning("CAME group_shapes: this torch has no torch.compile(isolate_recompiles=); "
+                                           "the grouped graphs share recompile_limit with the per-parameter ones.")
+                            self._compiled_grouped = torch.compile(
+                                self._core_factored_grouped_fp32, fullgraph=True, dynamic=False
+                            )
+                except Exception as e:
+                    logger.warning(f"CAME group_shapes: torch.compile failed ({e}); grouped step runs eagerly.")
+        return self._compiled_grouped
+
+    def _grouped_eligible(self, p: torch.Tensor, group: dict) -> bool:
+        r"""Whether `p` can take the grouped path. Only the case whose per-parameter path has no rounding / RNG side
+        effects: fp32 param and grad on CUDA, state fp32 on that same device (no staging copies), factored. bf16 params
+        (stochastic rounding draws random numbers per parameter), fp16 params / Kahan, bf16 or CPU state storage stay on
+        the per-parameter path."""
+        grad = p.grad
+        if self._use_staging or grad is None or grad.is_sparse or not p.is_cuda:
+            return False
+        if p.dtype != torch.float32 or grad.dtype != torch.float32 or not self.get_options(grad.shape):
+            return False
+        state = self.state[p]
+        if len(state) == 0:
+            # same initialization the per-parameter loop would do
+            self._init_param_state(p, group, grad.shape, True)
+        if 'exp_avg_sq_row' not in state or (group['ams_bound'] and 'exp_avg_sq_hat' not in state):
+            return False
+        keys = self._GROUPED_STATE_KEYS + (('exp_avg_sq_hat',) if group['ams_bound'] else ())
+        return all(state[k].device == p.device and state[k].dtype == torch.float32 for k in keys)
+
+    def _grouped_chunks(self, params: list) -> list:
+        r"""Split one same-shape bucket into near-equal chunks under group_shapes_max_numel (at most two distinct chunk
+        sizes per shape, so at most two compiled graphs per shape). Chunks of one parameter are dropped: the
+        per-parameter path handles them with no stacking cost."""
+        # [review fix 4] the cap is a real upper bound: at most `per_chunk` parameters fit under it (the old
+        # ceil(len / n_chunks) could round a chunk up to almost twice the cap for parameters near cap / 2).
+        per_chunk = self.group_shapes_max_numel // max(1, params[0].numel())
+        if per_chunk < 2:
+            return []
+        n_chunks = math.ceil(len(params) / per_chunk)
+        size = math.ceil(len(params) / n_chunks)  # <= per_chunk
+        chunks = [params[i:i + size] for i in range(0, len(params), size)]
+        if len(chunks) > 1 and len(chunks[-1]) < 2:
+            # [review 2, issue 3] that split left ONE parameter over (10 with room for 3: 3+3+3 and 1). Split evenly
+            # instead - sizes base+1 and base, both <= per_chunk: 3+3+2+2. base is 1 only for per_chunk == 2 and an odd
+            # count, and then one parameter is left to the per-parameter path anyway. Splits without a left-over one
+            # (all buckets of the Anima run, 2026-11-14) stay exactly as they were.
+            base, extra = divmod(len(params), n_chunks)
+            chunks, start = [], 0
+            for i in range(n_chunks):
+                step = base + (1 if i < extra else 0)
+                chunks.append(params[start:start + step])
+                start += step
+        return [c for c in chunks if len(c) >= 2]
+
+    @torch.no_grad()
+    def _grouped_factored_step(self, group: dict, group_idx: int) -> set:
+        r"""Run the factored step for same-shape buckets of `group`; returns the ids of the parameters it handled (the
+        per-parameter loop skips those). State tensors stay per parameter: they are stacked, updated, and copied back."""
+        buckets: dict = {}
+        # [review 2, issue 5] a parameter listed twice in the group is stepped twice by the per-parameter loop; a stack
+        # would read both copies from the same start and write one update. Leave such parameters to that loop.
+        seen, repeated = set(), set()
+        for p in group['params']:
+            (repeated if id(p) in seen else seen).add(id(p))
+        for p in group['params']:
+            if id(p) in repeated:
+                continue
+            if self._grouped_eligible(p, group):
+                buckets.setdefault((tuple(p.shape), p.device), []).append(p)
+
+        handled = set()
+        use_ams = group['ams_bound']
+        update_strategy = group['update_strategy']
+        core_fn = None
+        for (_shape, device), params in buckets.items():
+            for chunk in self._grouped_chunks(params):
+                if core_fn is None:
+                    core_fn = self._grouped_core_fn()
+                states = [self.state[p] for p in chunk]
+                keys = self._GROUPED_STATE_KEYS + (('exp_avg_sq_hat',) if use_ams else ())
+                stacked = {k: torch.stack([s[k] for s in states]) for k in keys}
+                grad = torch.stack([p.grad for p in chunk])
+                p_fp32 = torch.stack([p.data for p in chunk])
+                scalars = self._get_scalar_tensors(device, group_idx, group)
+
+                core_args = (
+                    grad, stacked['exp_avg'],
+                    stacked['exp_avg_sq_row'], stacked['exp_avg_sq_col'],
+                    stacked['exp_avg_res_row'], stacked['exp_avg_res_col'],
+                    stacked['exp_avg_sq_hat'] if use_ams else self._get_empty_tensor(device),
+                    scalars['beta1_t'], scalars['beta2_t'], scalars['beta3_t'],
+                    scalars['eps1_t'], scalars['eps2_t'], scalars['clip_t'],
+                    use_ams,
+                    scalars['lr_t'], scalars['wd_t'],
+                    group['weight_decouple'],
+                    group['fixed_decay'],
+                    group['cautious_weight_decay'],
+                    update_strategy in {'cautious', 'both'},
+                    update_strategy in {'grams', 'both'},
+                    p_fp32,
+                )
+                # [review fix 1] every (G, shape, flags) is one graph, and all torch.compile'd no_grad-decorated
+                # functions of the process share ONE dynamo cache (torch/_dynamo/external_utils.py inner): with
+                # fullgraph=True the entry after recompile_limit raises FailOnRecompileLimitHit. A run whose set of
+                # parameters with a gradient changes (module dropout, gated experts) would recompile every step and
+                # then stop. So: a budget of graphs for this function, the eager grouped core beyond it, and the eager
+                # core for good if the compiler refuses (a failed compile ran nothing: the stacked inputs are intact).
+                compiled = core_fn is not self._core_factored_grouped_fp32 and not self._grouped_compile_off
+                if compiled:
+                    graph_key = (len(chunk), _shape, core_args[13], core_args[16:21])
+                    if graph_key not in self._grouped_graph_keys:
+                        if len(self._grouped_graph_keys) >= self._GROUPED_MAX_GRAPHS:
+                            compiled = False
+                        else:
+                            self._grouped_graph_keys.add(graph_key)
+                if compiled:
+                    try:
+                        core_fn(*core_args, alphas=None)
+                    except self._grouped_compile_failures() as e:
+                        self._grouped_compile_off = True
+                        logger.warning(f"CAME group_shapes: torch.compile of the grouped step failed "
+                                       f"({type(e).__name__}); it runs eagerly from here on.")
+                        self._core_factored_grouped_fp32(*core_args, alphas=self._host_alphas(group))
+                else:
+                    self._core_factored_grouped_fp32(*core_args, alphas=self._host_alphas(group))
+
+                # [review fix 2] through the Parameter (no_grad), not p.data: the per-parameter path updates p in place
+                # here and bumps its version counter; code that keys a cache on p._version must keep seeing the step
+                torch._foreach_copy_(list(chunk), list(p_fp32.unbind(0)))
+                for k in keys:
+                    torch._foreach_copy_([s[k] for s in states], list(stacked[k].unbind(0)))
+                if not group['cautious_weight_decay'] and not group['weight_decouple']:
+                    # the per-parameter path adds the L2 term to p.grad in place (its grad IS p.grad here); keep that
+                    torch._foreach_copy_([p.grad for p in chunk], list(grad.unbind(0)))
+                handled.update(id(p) for p in chunk)
+                # [review 2, issue 2] core_args (and these names) would otherwise keep this chunk's stacked gradient,
+                # moments and parameter copy alive while the next chunk is stacked: 6 full-size buffers instead of 4
+                del core_args, grad, p_fp32, stacked
+
+        if not getattr(self, '_group_shapes_logged', False):
+            self._group_shapes_logged = True
+            logger.info(
+                f"CAME group_shapes: {len(handled)} parameters in "
+                f"{sum(len(self._grouped_chunks(v)) for v in buckets.values())} stacked chunks "
+                f"({len(buckets)} shapes); the rest use the per-parameter path."
+            )
+        return handled
 
     # --- Foreach Support (Unfactored params only) ---
 
@@ -974,6 +1296,7 @@ class CAME(BaseOptimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self._step_serial = getattr(self, '_step_serial', 0) + 1  # cached scalars / host alphas refill once per step
 
         for group in self.param_groups:
             if 'step' in group:
@@ -1037,10 +1360,15 @@ class CAME(BaseOptimizer):
                         group, unfactored_foreach_params, beta1, beta2, beta3, compute_device_for_foreach
                     )
 
+            # group_shapes (opt-in, 11-14): same-shape factored params in stacked chunks; the loop below skips them
+            grouped_ids = self._grouped_factored_step(group, group_idx) if self.group_shapes else None
+
             # Per-parameter loop for factored params or when foreach is disabled
             processed = 0
             for i, p in enumerate(group["params"]):
                 if p.grad is None:
+                    continue
+                if grouped_ids and id(p) in grouped_ids:
                     continue
 
                 grad = p.grad.data
@@ -1169,6 +1497,7 @@ class CAME(BaseOptimizer):
                         update_strategy in {'cautious', 'both'},
                         update_strategy in {'grams', 'both'},
                         p_fp32,
+                        alphas=None if core_factored_fn is not self._core_factored_full_fp32 else self._host_alphas(group),
                     )
                 else:
                     # Unfactored path (not handled by foreach) -- use full compiled step
@@ -1211,6 +1540,7 @@ class CAME(BaseOptimizer):
                         update_strategy in {'cautious', 'both'},
                         update_strategy in {'grams', 'both'},
                         p_fp32,
+                        alphas=None if core_unfactored_fn is not self._core_unfactored_full_fp32 else self._host_alphas(group),
                     )
 
                 # ========= Write-back (with optional Kahan compensation) =========

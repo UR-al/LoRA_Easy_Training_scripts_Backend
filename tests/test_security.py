@@ -11,7 +11,7 @@ and read files through /validate. Now:
 
 Run from the backend folder with the backend's Python (the middleware tests need starlette and httpx):
 
-    sd_scripts\\venv\\Scripts\\python -m unittest tests.test_security
+    sd_scripts\\venv_t214\\Scripts\\python -m unittest tests.test_security
 """
 
 import importlib.util

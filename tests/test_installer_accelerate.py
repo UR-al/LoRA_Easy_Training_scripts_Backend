@@ -6,7 +6,7 @@ it now removes that key from an existing config and leaves every other config un
 
 Run from the backend folder with the training venv (the parser tests need accelerate; they are skipped without it):
 
-    sd_scripts\\venv\\Scripts\\python -m unittest tests.test_installer_accelerate
+    sd_scripts\\venv_t214\\Scripts\\python -m unittest tests.test_installer_accelerate
 """
 
 import importlib.util
