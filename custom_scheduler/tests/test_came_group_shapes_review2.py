@@ -328,10 +328,13 @@ class CameGroupShapesFixGuardsTest(_CpuStandIns):
         cases = (
             (dict(), True, torch.float32),
             (dict(compile_step=True), True, torch.float32),
-            (dict(foreach=True, ams_bound=True), True, torch.float32),
-            (dict(weight_decouple=False, update_strategy="both"), True, torch.float32),
+            # The backups encode BUG-05/07/08. Only unaffected options belong
+            # in this identity test; independent CPU oracles cover those fixes
+            # in test_came_verified_bugs.py.
+            (dict(foreach=True), True, torch.float32),
+            (dict(update_strategy="both"), True, torch.float32),
             (dict(state_storage_dtype="bfloat16"), False, torch.float32),   # staging + stochastic rounding
-            (dict(kahan_sum=True), True, torch.bfloat16),
+            (dict(), True, torch.bfloat16),
         )
 
         def run(cls, kw, cuda_fp32_state, dtype):

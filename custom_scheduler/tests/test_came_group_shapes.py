@@ -1,7 +1,7 @@
 """CAME group_shapes (2026-11-14): same-shape factored parameters stepped together in stacked chunks.
 
 What is guarded here:
-  * flag off: bit-identical to came.py.bak_20261114_before_shapebatch (the code path is untouched);
+  * flag off: bit-identical to came.py.bak_20261114_before_shapebatch for unaffected options;
   * flag on: the same math per parameter - parameters and state within a few ulps of the per-parameter path (only the
     summation order of some CUDA reductions changes with the number of outputs), and the weights actually move under a
     TENSOR lr warmed up from 0 in place (the LyCORIS + constant_with_warmup case that froze the first 11-14 hotfix);
@@ -119,7 +119,9 @@ def _roundtrip(sd):
 class CameGroupShapesTest(unittest.TestCase):
     def test_flag_off_is_bit_identical_to_backup(self):
         old = _load_backup()
-        for extra in ({}, {"foreach": True}, {"update_strategy": "both", "ams_bound": True}):
+        # BUG-08 corrected the AMS variance units; the backup is no longer its
+        # numerical oracle. test_came_verified_bugs.py checks the AMS formula.
+        for extra in ({}, {"foreach": True}, {"update_strategy": "both"}):
             kw = dict(BASE, **extra)
             pa, oa, ma, total = _run(old.CAME, kw)
             pb, ob, mb, _ = _run(CAME, kw)  # group_shapes defaults to False

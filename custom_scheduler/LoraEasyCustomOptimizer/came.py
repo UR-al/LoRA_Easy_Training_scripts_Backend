@@ -209,6 +209,13 @@ class CAME(BaseOptimizer):
         'kahan_comp': torch.float32,
     }
 
+    def _state_dtype(self, key: str) -> torch.dtype:
+        # Squared tiny gradients underflow when stored in fp16, erasing the EMA
+        # between steps. Its AMS maximum needs the same range as the variance.
+        if self.state_storage_dtype == torch.float16 and key in {'exp_avg_sq', 'exp_avg_sq_hat'}:
+            return torch.float32
+        return self._STATE_STORAGE_DTYPES[key] or self.state_storage_dtype
+
     def load_state_dict(self, state_dict) -> None:
         r"""Load optimizer state and keep it under the storage policy (state_storage_dtype / state_storage_device).
 
@@ -218,6 +225,10 @@ class CAME(BaseOptimizer):
         therefore re-created from the saved values, which still have their original precision.
         """
         saved_state = state_dict['state']
+        saved_versions = {
+            pid: group.get('came_state_version', 1)
+            for group in state_dict['param_groups'] for pid in group['params']
+        }
         id_map = dict(zip(
             (pid for g in state_dict['param_groups'] for pid in g['params']),
             (p for g in self.param_groups for p in g['params']),
@@ -229,14 +240,26 @@ class CAME(BaseOptimizer):
             if p is None or p not in self.state:
                 continue
             state = self.state[p]
-            for key, dtype in self._STATE_STORAGE_DTYPES.items():
+            for key in self._STATE_STORAGE_DTYPES:
                 value = saved.get(key)
                 if not torch.is_tensor(value):
                     continue
-                value = value.to(device=self.state_storage_device, dtype=dtype or self.state_storage_dtype)
+                value = value.to(device=self.state_storage_device, dtype=self._state_dtype(key))
+                # Old checkpoints stored rounded-exact compensation and sqrt(v)
+                # AMS maxima. Convert out of place so the saved dict is untouched.
+                if saved_versions[pid] < 2:
+                    if key == 'kahan_comp':
+                        value = -value
+                    elif key == 'exp_avg_sq_hat':
+                        value = value.square()
                 if self.state_storage_device == "cpu":
                     value = value.pin_memory()
                 state[key] = value
+
+        for group in self.param_groups:
+            if any('kahan_comp' in self.state.get(p, {}) or 'exp_avg_sq_hat' in self.state.get(p, {})
+                   for p in group['params']):
+                group['came_state_version'] = 2
 
     def _init_param_state(self, p: torch.Tensor, group: dict, grad_shape: Tuple[int, ...], factored: bool) -> None:
         r"""Initialize optimizer state tensors for a parameter on first encounter.
@@ -276,14 +299,14 @@ class CAME(BaseOptimizer):
         else:
             state['exp_avg_sq'] = torch.zeros(
                 grad_shape,
-                dtype=self.state_storage_dtype,
+                dtype=self._state_dtype('exp_avg_sq'),
                 device=self.state_storage_device
             )
 
         if group['ams_bound']:
             state['exp_avg_sq_hat'] = torch.zeros(
                 grad_shape,
-                dtype=self.state_storage_dtype,
+                dtype=self._state_dtype('exp_avg_sq_hat'),
                 device=self.state_storage_device
             )
 
@@ -302,6 +325,11 @@ class CAME(BaseOptimizer):
                 dtype=torch.float32,
                 device=self.state_storage_device
             )
+
+        # Version only groups whose buffer convention changed; default state
+        # dictionaries retain their existing keys.
+        if 'kahan_comp' in state or 'exp_avg_sq_hat' in state:
+            group['came_state_version'] = 2
 
         # Pin memory for CPU storage (enables async GPU transfers)
         if self.state_storage_device == "cpu":
@@ -378,6 +406,11 @@ class CAME(BaseOptimizer):
         use_cautious, use_grams) are compile-time constants resolved during tracing.
         """
         # update = grad^2 + eps1
+        # Coupled L2 belongs to the gradient before either moment is updated.
+        # Cautious weight decay keeps its separate, decoupled policy.
+        if not weight_decouple and not cautious_weight_decay:
+            grad.add_(p_fp32, alpha=weight_decay)
+
         update = torch.mul(grad, grad).add_(eps1)
 
         # Factored second moment EMA
@@ -394,8 +427,12 @@ class CAME(BaseOptimizer):
 
         # AMSBound
         if use_amsbound:
-            torch.max(exp_avg_sq_hat, 1.0 / update, out=exp_avg_sq_hat)
-            torch.rsqrt(exp_avg_sq_hat / beta2, out=update)
+            # Keep the maximum in variance space, matching the non-AMS denominator.
+            # CAME uses uncorrected EMAs; dividing by beta2 is not bias correction.
+            variance = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).unsqueeze(-1) \
+                * exp_avg_sq_col.unsqueeze(-2)
+            torch.max(exp_avg_sq_hat, variance, out=exp_avg_sq_hat)
+            torch.rsqrt(exp_avg_sq_hat, out=update)
 
         # Precondition gradient
         update.mul_(grad)
@@ -429,9 +466,6 @@ class CAME(BaseOptimizer):
         elif weight_decouple:
             wd_factor = 1.0 if fixed_decay else lr
             p_fp32.mul_(1.0 - weight_decay * wd_factor)
-        else:
-            # Standard (non-decoupled) weight decay: add scaled parameter to gradient
-            grad.add_(p_fp32, alpha=weight_decay)
 
         # === LR scale ===
         update.mul_(lr)
@@ -484,6 +518,11 @@ class CAME(BaseOptimizer):
         red = tuple(range(1, grad.dim()))       # the dims of ONE parameter
         numel = math.prod(grad.shape[1:])       # static under dynamic=False
 
+        # Coupled L2 belongs to the gradient before either moment is updated.
+        # Cautious weight decay keeps its separate, decoupled policy.
+        if not weight_decouple and not cautious_weight_decay:
+            grad.add_(p_fp32, alpha=weight_decay)
+
         update = torch.mul(grad, grad).add_(eps1)
 
         a1, a2, a3 = (1.0 - beta1, 1.0 - beta2, 1.0 - beta3) if alphas is None else alphas
@@ -495,8 +534,12 @@ class CAME(BaseOptimizer):
         torch.mul(r_factor, c_factor, out=update)
 
         if use_amsbound:
-            torch.max(exp_avg_sq_hat, 1.0 / update, out=exp_avg_sq_hat)
-            torch.rsqrt(exp_avg_sq_hat / beta2, out=update)
+            # Keep the maximum in variance space, matching the non-AMS denominator.
+            # CAME uses uncorrected EMAs; dividing by beta2 is not bias correction.
+            variance = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).unsqueeze(-1) \
+                * exp_avg_sq_col.unsqueeze(-2)
+            torch.max(exp_avg_sq_hat, variance, out=exp_avg_sq_hat)
+            torch.rsqrt(exp_avg_sq_hat, out=update)
 
         update.mul_(grad)
 
@@ -524,8 +567,6 @@ class CAME(BaseOptimizer):
         elif weight_decouple:
             wd_factor = 1.0 if fixed_decay else lr
             p_fp32.mul_(1.0 - weight_decay * wd_factor)
-        else:
-            grad.add_(p_fp32, alpha=weight_decay)
 
         update.mul_(lr)
 
@@ -572,6 +613,11 @@ class CAME(BaseOptimizer):
         Branch booleans are compile-time constants resolved during tracing.
         """
         # update = grad^2 + eps1
+        # Coupled L2 belongs to the gradient before either moment is updated.
+        # Cautious weight decay keeps its separate, decoupled policy.
+        if not weight_decouple and not cautious_weight_decay:
+            grad.add_(p_fp32, alpha=weight_decay)
+
         update = torch.mul(grad, grad).add_(eps1)
 
         # EMA of squared gradient
@@ -581,8 +627,8 @@ class CAME(BaseOptimizer):
 
         # AMSBound
         if use_amsbound:
-            torch.max(exp_avg_sq_hat, 1.0 / update, out=exp_avg_sq_hat)
-            torch.rsqrt(exp_avg_sq_hat / beta2, out=update)
+            torch.max(exp_avg_sq_hat, exp_avg_sq, out=exp_avg_sq_hat)
+            torch.rsqrt(exp_avg_sq_hat, out=update)
 
         # Precondition gradient
         update.mul_(grad)
@@ -613,8 +659,6 @@ class CAME(BaseOptimizer):
         elif weight_decouple:
             wd_factor = 1.0 if fixed_decay else lr
             p_fp32.mul_(1.0 - weight_decay * wd_factor)
-        else:
-            grad.add_(p_fp32, alpha=weight_decay)
 
         # === LR scale ===
         update.mul_(lr)
@@ -1103,6 +1147,9 @@ class CAME(BaseOptimizer):
         one_minus_beta2 = float(1.0 - _fp32(beta2))
         one_minus_beta3 = float(1.0 - _fp32(beta3))
 
+        if not wd_decouple and not cwd:
+            torch._foreach_add_(grad_list, p_fp32_list, alpha=float(_fp32(wd)))
+
         # 1. EMA of squared gradient: exp_avg_sq = beta2 * exp_avg_sq + (1-beta2) * (grad^2 + eps1)
         update_list = torch._foreach_mul(grad_list, grad_list)  # grad^2 — batched (the per-step update buffers)
         torch._foreach_add_(update_list, group['eps1'])  # grad^2 + eps1
@@ -1118,12 +1165,11 @@ class CAME(BaseOptimizer):
 
         # AMSBound — update hat state, then compute denom from hat
         if use_amsbound:
-            # hat = max(hat, 1/denom) = max(hat, sqrt(EMA))
-            torch._foreach_maximum_(exp_avg_sq_hat_list, [1.0 / d for d in update_list])
-            # Compute denom = rsqrt(hat / beta2) into update_list (reuse allocation)
+            # Keep the running maximum of the raw variance (no bias correction).
+            torch._foreach_maximum_(exp_avg_sq_hat_list, exp_avg_sq_list)
+            # Compute denom = rsqrt(hat) into update_list (reuse allocation)
             for _i in range(len(update_list)):
                 update_list[_i].copy_(exp_avg_sq_hat_list[_i])
-            torch._foreach_div_(update_list, beta2)
             torch._foreach_rsqrt_(update_list)
 
         # 3. Precondition: update = denom * grad
@@ -1182,9 +1228,6 @@ class CAME(BaseOptimizer):
         elif wd_decouple:
             wd_factor = 1.0 if fixed_decay else _fp32(lr)
             torch._foreach_mul_(p_fp32_list, float(1.0 - _fp32(wd) * wd_factor))
-        else:
-            # Standard (non-decoupled) weight decay: add scaled parameter to gradient
-            torch._foreach_add_(grad_list, p_fp32_list, alpha=float(_fp32(wd)))
 
         # 9. LR scale
         torch._foreach_mul_(final_update_list, lr)
@@ -1243,14 +1286,12 @@ class CAME(BaseOptimizer):
                 else:
                     p.data.copy_(kahan_sim, non_blocking=True)
 
-                # Compute new compensation: rounded - exact
-                kahan_sim.sub_(p_fp32)
+                # Compute new compensation: exact - rounded (added on the next step)
+                torch.sub(p_fp32, kahan_sim, out=kahan_sim)
 
                 # Store compensation back to state
-                if self.state_storage_dtype == torch.bfloat16:
-                    copy_stochastic_(state['kahan_comp'], kahan_sim, scratch=srng)
-                else:
-                    state['kahan_comp'].copy_(kahan_sim, non_blocking=True)
+                # This buffer is always fp32, regardless of moment storage dtype.
+                state['kahan_comp'].copy_(kahan_sim, non_blocking=True)
             else:
                 # Standard parameter write-back
                 if device.type == "cpu":
@@ -1281,10 +1322,8 @@ class CAME(BaseOptimizer):
 
             if nfc:
                 ear = exp_avg_res_list[i]
-                if self.state_storage_dtype == torch.bfloat16:
-                    copy_stochastic_(state['exp_avg_res'], ear, scratch=srng)
-                else:
-                    state['exp_avg_res'].copy_(ear, non_blocking=True)
+                # This buffer is always fp32, regardless of moment storage dtype.
+                state['exp_avg_res'].copy_(ear, non_blocking=True)
 
             # Sync chunking
             if (i + 1) % group.get('sync_chunk_size', 256) == 0:
@@ -1566,14 +1605,12 @@ class CAME(BaseOptimizer):
                     else:
                         p.data.copy_(kahan_sim, non_blocking=True)
 
-                    # Compute new compensation: rounded - exact
-                    kahan_sim.sub_(p_fp32)
+                    # Compute new compensation: exact - rounded (added on the next step)
+                    torch.sub(p_fp32, kahan_sim, out=kahan_sim)
 
                     # Store compensation back to state
-                    if self.state_storage_dtype == torch.bfloat16:
-                        copy_stochastic_(state['kahan_comp'], kahan_sim, scratch=srng)
-                    else:
-                        state['kahan_comp'].copy_(kahan_sim, non_blocking=True)
+                    # This buffer is always fp32, regardless of moment storage dtype.
+                    state['kahan_comp'].copy_(kahan_sim, non_blocking=True)
                 else:
                     # Standard parameter write-back
                     if device.type == "cpu":
@@ -1608,10 +1645,8 @@ class CAME(BaseOptimizer):
 
                 # Non-factored confidence write-back
                 if not factored and nfc and 'exp_avg_res' in state:
-                    if self.state_storage_dtype == torch.bfloat16:
-                        copy_stochastic_(state['exp_avg_res'], exp_avg_res_nonfac, scratch=srng)
-                    else:
-                        state['exp_avg_res'].copy_(exp_avg_res_nonfac, non_blocking=True)
+                    # This buffer is always fp32, regardless of moment storage dtype.
+                    state['exp_avg_res'].copy_(exp_avg_res_nonfac, non_blocking=True)
 
                 # ========= Sync chunking (use processed count, not raw loop index) =========
                 processed += 1
